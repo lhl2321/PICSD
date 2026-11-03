@@ -9,7 +9,7 @@ from torchcrf import CRF
 
 
 # ---------------------------------------------------------------------------
-# Transformer 基础组件
+# Transformer building blocks
 # ---------------------------------------------------------------------------
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
@@ -111,7 +111,7 @@ class TransformerEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MoE 模块
+# Mixture-of-experts module
 # ---------------------------------------------------------------------------
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -166,7 +166,10 @@ class MLPExpert(nn.Module):
 
 
 class MoE_Block(nn.Module):
-    """Top-k 路由 MoE 模块，带可导负载均衡损失和路由统计。"""
+    """Top-k routed MoE block with a differentiable load-balancing loss.
+
+    It also keeps routing statistics for diagnostics.
+    """
 
     def __init__(self, input_size, output_size, num_experts, hidden_size,
                  k=2, router_noise=0.01):
@@ -180,7 +183,7 @@ class MoE_Block(nn.Module):
 
         if not 1 <= self.k <= self.num_experts:
             raise ValueError(
-                f"moe_top_k必须位于[1, num_experts]，当前k={self.k}, "
+                f"moe_top_k must be in [1, num_experts], got k={self.k}, "
                 f"num_experts={self.num_experts}"
             )
 
@@ -189,7 +192,8 @@ class MoE_Block(nn.Module):
             for _ in range(self.num_experts)
         ])
 
-        # 不能使用全零初始化，否则Top-k在训练初期容易固定选择同一批专家。
+        # Do not use all-zero initialization: Top-k routing would otherwise lock
+        # onto the same set of experts during the first training steps.
         self.w_gate = nn.Parameter(torch.empty(input_size, self.num_experts))
         nn.init.normal_(self.w_gate, mean=0.0, std=0.02)
 
@@ -210,7 +214,7 @@ class MoE_Block(nn.Module):
     def top_k_gating(self, x):
         router_logits = x @ self.w_gate
 
-        # 轻微噪声用于打破专家选择对称性，仅在训练阶段加入。
+        # Small noise breaks the symmetry of expert selection; training only.
         if self.training and self.router_noise > 0:
             router_logits = router_logits + (
                 self.router_noise * torch.randn_like(router_logits)
@@ -230,13 +234,13 @@ class MoE_Block(nn.Module):
         gates = torch.zeros_like(router_probs)
         gates = gates.scatter(1, top_k_indices, top_k_gates)
 
-        # importance可导；均匀路由时该损失接近0。
+        # `importance` is differentiable; the loss is near zero for uniform routing.
         importance = router_probs.mean(dim=0)
         balance_loss = (
             self.num_experts * torch.sum(importance.pow(2)) - 1.0
         )
 
-        # hard load用于诊断，不参与梯度。
+        # Hard load is a diagnostic quantity and does not receive gradients.
         hard_load = (gates > 0).float().mean(dim=0)
         selection_share = hard_load / (hard_load.sum() + 1e-8)
         router_entropy = -(
@@ -273,7 +277,7 @@ class MoE_Block(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Shapelet 嵌入层（支持多变量）
+# Shapelet embedding layer (multi-variate input)
 # ---------------------------------------------------------------------------
 class ShapeEmbedLayer(nn.Module):
     def __init__(self, seq_len, shape_size, in_chans, embed_dim, stride=4):
@@ -289,10 +293,10 @@ class ShapeEmbedLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Soft Shape 稀疏化辅助函数
+# Soft Shape sparsification helpers
 # ---------------------------------------------------------------------------
 def coml_index(input_indx, dim):
-    """计算补集索引"""
+    """Return the complement indices of `input_indx` along `dim`."""
     full_idx = torch.arange(dim, device=input_indx.device)
     mask = torch.ones(input_indx.size(0), dim, dtype=torch.bool, device=input_indx.device)
 
@@ -304,7 +308,7 @@ def coml_index(input_indx, dim):
 
 
 # ---------------------------------------------------------------------------
-# Inception 模块（多尺度特征提取）
+# Inception module (multi-scale feature extraction)
 # ---------------------------------------------------------------------------
 class InceptionModule(nn.Module):
     def __init__(self, ni, nf, ks=None, bottleneck=True):
@@ -360,7 +364,7 @@ class InceptionModule(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SoftShape Learning Block（含 MoE 与 Inception）
+# SoftShape learning block (MoE + Inception)
 # ---------------------------------------------------------------------------
 class SoftShapeNet_layer(nn.Module):
     def __init__(self, dim, moe_nets=None, atten_head=None):
@@ -438,7 +442,7 @@ class SoftShapeNet_layer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Shapelet Filter（基于 ShapeFormer 的 shapelet 相似度特征）
+# Shapelet filter (shapelet-similarity features, ShapeFormer style)
 # ---------------------------------------------------------------------------
 class ShapeletFilter(nn.Module):
     def __init__(self, seq_len, num_vars, shapelet_dim=32, num_shapelets=10):
@@ -475,7 +479,8 @@ class ShapeletFilter(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 主模型：三路径混合架构（SoftShape MoE + 类别特定Transformer + 通用Transformer）
+# Main model: three-path hybrid architecture
+# (SoftShape MoE + class-specific Transformer + generic Transformer)
 # ---------------------------------------------------------------------------
 class SoftShapeTransformerNet(nn.Module):
     def __init__(self, seq_len, shape_size, num_channels, emb_dim, sparse_rate, depth,
@@ -497,7 +502,7 @@ class SoftShapeTransformerNet(nn.Module):
         self.num_classes = num_classes
         self.stride = stride
 
-        # ========== 路径1: SoftShape MoE 路径 ==========
+        # ========== Path 1: SoftShape MoE path ==========
         self.shape_embed = ShapeEmbedLayer(
             seq_len=self.seq_len, shape_size=self.shape_size,
             in_chans=self.num_channels, embed_dim=self.emb_dim, stride=stride
@@ -505,7 +510,8 @@ class SoftShapeTransformerNet(nn.Module):
 
         if self.shape_embed.num_patches <= 0:
             raise ValueError(
-                f"num_patches必须大于0，当前为{self.shape_embed.num_patches}。请检查seq_len={seq_len}, shape_size={shape_size}, stride={stride}")
+                f"num_patches must be greater than 0, got {self.shape_embed.num_patches}. "
+                f"Check seq_len={seq_len}, shape_size={shape_size}, stride={stride}")
 
         self.attention_head = nn.Sequential(
             nn.Linear(self.emb_dim, 8),
@@ -532,7 +538,7 @@ class SoftShapeTransformerNet(nn.Module):
             for _ in range(self.depth)]
         )
 
-        # ========== 路径2: 类别特定 Transformer 路径 ==========
+        # ========== Path 2: class-specific Transformer path ==========
         self.shapelet_filter = ShapeletFilter(
             seq_len=seq_len,
             num_vars=num_channels,
@@ -546,7 +552,7 @@ class SoftShapeTransformerNet(nn.Module):
             num_layers=min(2, transformer_layers)
         )
 
-        # ========== 路径3: 通用 Transformer 路径 ==========
+        # ========== Path 3: generic Transformer path ==========
         self.generic_conv = nn.Sequential(
             nn.Conv1d(num_channels, emb_dim // 2, kernel_size=3, padding=1),
             nn.BatchNorm1d(emb_dim // 2),
@@ -562,7 +568,7 @@ class SoftShapeTransformerNet(nn.Module):
             num_layers=min(2, transformer_layers)
         )
 
-        # ========== 特征融合与分类头 ==========
+        # ========== Feature fusion and classification head ==========
         total_feat_dim = emb_dim * 2
         self.fusion_proj = nn.Linear(total_feat_dim, emb_dim)
 
@@ -599,7 +605,7 @@ class SoftShapeTransformerNet(nn.Module):
         B, C, T = x.shape
         total_moe_loss = 0.0
 
-        # ========== 路径1: SoftShape MoE 路径 ==========
+        # ========== Path 1: SoftShape MoE path ==========
         try:
             x1 = self.shape_embed(x)
             x1 = x1 + self.pos_embed
@@ -612,7 +618,8 @@ class SoftShapeTransformerNet(nn.Module):
         d = 0
         end_attn_x_score = None
 
-        # 前warm_up_epoch轮不稀疏；随后在sparse_ramp_epoch轮内从0线性增加到目标稀疏率。
+        # No sparsification during the first `warm_up_epoch` epochs; the sparse
+        # rate then ramps linearly from 0 to the target over `sparse_ramp_epoch`.
         if num_epoch_i < warm_up_epoch:
             sparse_progress = 0.0
         else:
@@ -660,7 +667,7 @@ class SoftShapeTransformerNet(nn.Module):
         else:
             path1_feat = torch.zeros(B, self.emb_dim, device=x.device)
 
-        # ========== 路径2: 类别特定 Transformer 路径 ==========
+        # ========== Path 2: class-specific Transformer path ==========
         try:
             shapelet_features = self.shapelet_filter(x)
             shapelet_features = shapelet_features.squeeze(-1)
@@ -679,7 +686,7 @@ class SoftShapeTransformerNet(nn.Module):
             print(f"Error in path 2 (shapelet filter): {e}")
             path2_feat = torch.zeros(B, self.emb_dim // 2, device=x.device)
 
-        # ========== 路径3: 通用 Transformer 路径 ==========
+        # ========== Path 3: generic Transformer path ==========
         try:
             conv_features = self.generic_conv(x)
             conv_features = conv_features.permute(0, 2, 1)
@@ -694,7 +701,7 @@ class SoftShapeTransformerNet(nn.Module):
             print(f"Error in path 3 (generic transformer): {e}")
             path3_feat = torch.zeros(B, self.emb_dim // 2, device=x.device)
 
-        # ========== 特征融合与分类 ==========
+        # ========== Feature fusion and classification ==========
         combined_feat = torch.cat([path1_feat, path2_feat, path3_feat], dim=1)
         fused_feat = self.fusion_proj(combined_feat)
         logits = self.classifier(fused_feat)
@@ -706,15 +713,32 @@ class SoftShapeTransformerNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 地层序列 CRF 约束模型（整井单向层序软约束）
+# Stratigraphic-sequence CRF model (monotone whole-well prior)
 # ---------------------------------------------------------------------------
 class StratigraphyCRFNet(nn.Module):
     def __init__(
         self,
         base_model,
         num_classes,
-        transition_penalty=-3.0
+        transition_penalty=-3.0,
+        class_order=None
     ):
+        """
+        Parameters
+        ----------
+        base_model : nn.Module
+            Slice-level classifier that produces emission scores.
+        num_classes : int
+            Number of stratigraphic classes.
+        transition_penalty : float
+            Soft penalty applied to transitions that contradict the prior.
+        class_order : list[int] or None
+            Class indices ordered from the shallowest (top) member to the
+            deepest (bottom) member. Defaults to the identity order
+            ``[0, 1, ..., num_classes - 1]``. The notebook converts
+            user-provided member names into this index order before
+            constructing the model.
+        """
         super().__init__()
 
         self.base_model = base_model
@@ -727,6 +751,17 @@ class StratigraphyCRFNet(nn.Module):
             transition_penalty
         )
 
+        if class_order is None:
+            class_order = list(range(num_classes))
+
+        self.class_order = [int(tag) for tag in class_order]
+
+        if sorted(self.class_order) != list(range(num_classes)):
+            raise ValueError(
+                "class_order must contain every class index exactly once, "
+                f"got {self.class_order} for num_classes={num_classes}"
+            )
+
         self.register_buffer(
             "invalid_transition_mask",
             self._build_stratigraphy_mask()
@@ -734,31 +769,33 @@ class StratigraphyCRFNet(nn.Module):
 
     def _build_stratigraphy_mask(self):
         """
-        采用整井CRF的单向层序软约束。
+        Build the transition mask from the user-defined stratigraphic order.
 
-        标签编码：嘉一=0、嘉三=1、嘉二=2、嘉五=3、嘉四=4。
-        slice编号递增方向：嘉五(3)->嘉四(4)->嘉三(1)->嘉二(2)->嘉一(0)。
+        Only self-transitions and transitions between adjacent members in
+        `class_order` (top to bottom) are allowed. All other transitions are
+        marked as invalid and later receive a fixed soft penalty.
         """
+        num_tags = self.crf.num_tags
         mask = torch.ones(
-            (self.crf.num_tags, self.crf.num_tags),
+            (num_tags, num_tags),
             dtype=torch.bool
         )
 
-        valid_transitions = [
-            (0, 0), (1, 1), (2, 2), (3, 3), (4, 4),
-            (3, 4),  # 嘉五 -> 嘉四
-            (4, 1),  # 嘉四 -> 嘉三
-            (1, 2),  # 嘉三 -> 嘉二
-            (2, 0),  # 嘉二 -> 嘉一
-        ]
+        # Self-transitions are always allowed.
+        for tag in range(num_tags):
+            mask[tag, tag] = False
 
-        for start_tag, end_tag in valid_transitions:
-            mask[start_tag, end_tag] = False
+        # Consecutive downward transitions are allowed.
+        for shallow_tag, deep_tag in zip(
+            self.class_order[:-1],
+            self.class_order[1:]
+        ):
+            mask[shallow_tag, deep_tag] = False
 
         return mask
 
     def _apply_transition_constraints(self):
-        """对非单向层序转移施加固定软惩罚。"""
+        """Apply the fixed soft penalty to transitions that are sequence errors under the prior."""
         with torch.no_grad():
             self.crf.transitions.data.masked_fill_(
                 self.invalid_transition_mask,
@@ -772,14 +809,19 @@ class StratigraphyCRFNet(nn.Module):
         warm_up_epoch=50
     ):
         """
-        计算每个切片的发射分数。
+        Compute emission scores for every slice in a well sequence.
 
-        x_seq: [B, S, C, T]
+        Parameters
+        ----------
+        x_seq : torch.Tensor
+            Slice sequence of shape [B, S, C, T].
 
-        返回
-        ----
-        emissions: [B, S, num_classes]
-        moe_loss: scalar tensor
+        Returns
+        -------
+        emissions : torch.Tensor
+            Emission scores of shape [B, S, num_classes].
+        moe_loss : torch.Tensor
+            Scalar MoE load-balancing loss.
         """
         B, S, C, T = x_seq.shape
 
@@ -799,7 +841,7 @@ class StratigraphyCRFNet(nn.Module):
         return emissions, moe_loss
 
     def decode(self, emissions):
-        """使用同一组 emissions 进行 Viterbi 解码。"""
+        """Run Viterbi decoding on the given emission scores."""
         self._apply_transition_constraints()
 
         best_paths = self.crf.decode(emissions)
@@ -819,11 +861,15 @@ class StratigraphyCRFNet(nn.Module):
         return_emissions=False
     ):
         """
-        x_seq:  [B, S, C, T]
-        labels: [B, S]
+        Parameters
+        ----------
+        x_seq : torch.Tensor
+            Slice sequence of shape [B, S, C, T].
+        labels : torch.Tensor or None
+            Ground-truth labels of shape [B, S].
 
-        传入 labels 时返回 CRF loss、MoE loss 和可选 emissions；
-        未传入 labels 时返回 Viterbi 解码结果。
+        With `labels`, the CRF loss, the MoE loss and optionally the emissions
+        are returned. Without `labels`, the Viterbi decoding result is returned.
         """
         emissions, moe_loss = self.get_emissions(
             x_seq=x_seq,
